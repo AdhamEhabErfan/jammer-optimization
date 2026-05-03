@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Trained models
+*.pth
+
+# Environment files
+.env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
