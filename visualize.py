@@ -8,19 +8,20 @@ from models.hybrid_model import HybridJammerNet
 
 def visualize_jamming(config, num_steps=100):
     """Visualize jammer power allocation vs. true TX bands over time"""
-    device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
+    # Auto-detect device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🖥️  Using device: {device}")
     
     # Load hybrid model
     model = HybridJammerNet(config.NUM_BANDS, config.SENSING_WINDOW,
                              config.LSTM_HIDDEN_SIZE).to(device)
-    model.load_state_dict(torch.load('hybrid_jammer.pth'))
+    model.load_state_dict(torch.load('hybrid_jammer.pth', map_location=device))
     model.eval()
     
     # Generate sequence
     tx = FrequencyHoppingTransmitter(config.NUM_BANDS, config.FH_ALGORITHM, config.FH_SEED)
     sequence = tx.generate_sequence(num_steps + config.SENSING_WINDOW)
     
-    # Get power allocations
     power_matrix = np.zeros((num_steps, config.NUM_BANDS))
     true_bands = []
     
@@ -35,10 +36,8 @@ def visualize_jamming(config, num_steps=100):
         power_matrix[i] = power.cpu().numpy()[0]
         true_bands.append(sequence[i + config.SENSING_WINDOW])
     
-    # Plot
     fig, axes = plt.subplots(2, 1, figsize=(14, 8))
     
-    # Heatmap of jammer power
     im = axes[0].imshow(power_matrix.T, aspect='auto', cmap='hot', origin='lower')
     axes[0].plot(range(num_steps), true_bands, 'co', markersize=4, 
                  label='True TX Band', alpha=0.7)
@@ -48,7 +47,6 @@ def visualize_jamming(config, num_steps=100):
     axes[0].legend()
     plt.colorbar(im, ax=axes[0], label='Power')
     
-    # Power on true band over time
     power_on_true = [power_matrix[t, true_bands[t]] for t in range(num_steps)]
     axes[1].plot(power_on_true, 'b-', linewidth=1.5)
     axes[1].axhline(y=1.0/config.NUM_BANDS, color='r', linestyle='--', 
@@ -63,7 +61,7 @@ def visualize_jamming(config, num_steps=100):
     plt.savefig('jamming_visualization.png', dpi=150)
     plt.show()
     
-    print(f"Avg power on true band: {np.mean(power_on_true):.4f}")
+    print(f"\nAvg power on true band: {np.mean(power_on_true):.4f}")
     print(f"Random baseline:        {1.0/config.NUM_BANDS:.4f}")
     print(f"Improvement factor:     {np.mean(power_on_true) * config.NUM_BANDS:.2f}x")
 

@@ -1,28 +1,15 @@
 import numpy as np
-import gym
-from gym import spaces
 from frequency_hopping import FrequencyHoppingTransmitter, Channel
 
-class JammerEnvironment(gym.Env):
-    """RL Environment for the jammer agent"""
+
+class JammerEnvironment:
+    """RL Environment for the jammer agent (no gym dependency)"""
     
     def __init__(self, config):
-        super().__init__()
         self.config = config
         self.num_bands = config.NUM_BANDS
         self.sensing_window = config.SENSING_WINDOW
         self.num_jammer_bands = config.NUM_JAMMER_BANDS
-        
-        # Action space: select which bands to jam (discrete combinations)
-        # Simplified: pick top-K bands to allocate power
-        self.action_space = spaces.Discrete(self.num_bands)
-        
-        # Observation: history of observed transmitter bands (one-hot)
-        self.observation_space = spaces.Box(
-            low=0, high=1, 
-            shape=(self.sensing_window, self.num_bands),
-            dtype=np.float32
-        )
         
         self.tx = FrequencyHoppingTransmitter(
             num_bands=self.num_bands,
@@ -37,13 +24,19 @@ class JammerEnvironment(gym.Env):
         
         self.history = None
         self.current_step = 0
+        self.episode_count = 0
     
-    def reset(self):
-        self.tx.reset()
+    def reset(self, episode_seed=None):
+        """Reset with a different starting state each episode"""
+        self.episode_count += 1
+        if episode_seed is None:
+            # Use episode count to vary the starting state
+            episode_seed = self.config.FH_SEED + self.episode_count * 1000
+        
+        self.tx.reset(new_seed=episode_seed)
         self.history = np.zeros((self.sensing_window, self.num_bands), dtype=np.float32)
         self.current_step = 0
         
-        # Fill initial history
         for i in range(self.sensing_window):
             band = self.tx.get_next_band()
             self.history[i, band] = 1.0
@@ -51,34 +44,28 @@ class JammerEnvironment(gym.Env):
         return self.history.copy()
     
     def step(self, action):
-        """
-        action: predicted band(s) to jam
-        Can be a single integer (top-1) or array of probabilities
-        """
-        # Get true next band from transmitter
         true_band = self.tx.get_next_band()
         
         # Build power allocation
         if isinstance(action, (int, np.integer)):
-            # Single band targeting
             power_allocation = np.zeros(self.num_bands)
             power_allocation[action] = self.config.JAMMER_TOTAL_POWER
         else:
-            # Distributed power allocation (probability vector)
-            power_allocation = np.array(action) * self.config.JAMMER_TOTAL_POWER
+            action = np.asarray(action, dtype=np.float32).flatten()
+            # Normalize to sum to JAMMER_TOTAL_POWER
+            action = action / (action.sum() + 1e-10)
+            power_allocation = action * self.config.JAMMER_TOTAL_POWER
         
-        # Compute reward based on jamming success
         sinr = self.channel.compute_sinr(true_band, power_allocation)
         sinr_db = 10 * np.log10(sinr + 1e-10)
         
-        # Reward: higher when SINR is lower (better jamming)
-        reward = -sinr_db / 10.0  # Normalize
+        # Improved reward: more sensitive to power on true band
+        power_on_true = power_allocation[true_band]
+        reward = power_on_true * 10.0 - sinr_db / 10.0
         
-        # Bonus for direct hit
         if isinstance(action, (int, np.integer)) and action == true_band:
             reward += 5.0
         
-        # Update history (sliding window)
         self.history = np.roll(self.history, -1, axis=0)
         self.history[-1] = 0
         self.history[-1, true_band] = 1.0
@@ -87,9 +74,10 @@ class JammerEnvironment(gym.Env):
         done = self.current_step >= self.config.EPISODE_LENGTH
         
         info = {
-            'true_band': true_band,
-            'sinr_db': sinr_db,
-            'jammed': sinr_db < 1.0
+            'true_band': int(true_band),
+            'sinr_db': float(sinr_db),
+            'jammed': bool(self.channel.is_jammed(true_band, power_allocation)),
+            'power_on_true': float(power_on_true)
         }
         
         return self.history.copy(), reward, done, info

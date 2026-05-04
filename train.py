@@ -43,20 +43,24 @@ def train_lstm_predictor(config):
     print("=" * 60)
     
     device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
+    print(f"🖥️  Using device: {device}")
     
-    # Generate data
-    X, y = generate_training_data(config, num_sequences=10000)
-    split = int(0.8 * len(X))
+    # ⭐ MORE training data
+    X, y = generate_training_data(config, num_sequences=50000)  # ← was 10000
+    
+    split = int(0.85 * len(X))
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
     
+    print(f"📊 Training samples: {len(X_train)}, Validation: {len(X_val)}")
+    
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
-        batch_size=64, shuffle=True
+        batch_size=128, shuffle=True, num_workers=2, pin_memory=True
     )
     val_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
-        batch_size=64
+        batch_size=256
     )
     
     model = LSTMPredictor(
@@ -66,12 +70,17 @@ def train_lstm_predictor(config):
         dropout=config.DROPOUT
     ).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    # ⭐ Lower learning rate + scheduler
+    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     criterion = nn.CrossEntropyLoss()
     
     train_losses, val_accs = [], []
+    best_acc = 0
     
-    for epoch in range(50):
+    NUM_EPOCHS = 100  # ⭐ More epochs
+    
+    for epoch in range(NUM_EPOCHS):
         model.train()
         epoch_loss = 0
         for xb, yb in train_loader:
@@ -80,35 +89,51 @@ def train_lstm_predictor(config):
             logits = model(xb)
             loss = criterion(logits, yb)
             loss.backward()
+            # ⭐ Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_loss += loss.item()
+        
+        scheduler.step()
         
         # Validation
         model.eval()
         correct, total = 0, 0
+        top3_correct = 0
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                preds = model(xb).argmax(dim=-1)
+                logits = model(xb)
+                preds = logits.argmax(dim=-1)
                 correct += (preds == yb).sum().item()
                 total += yb.size(0)
+                # Top-3 accuracy
+                top3 = torch.topk(logits, 3, dim=-1).indices
+                top3_correct += (top3 == yb.unsqueeze(1)).any(dim=1).sum().item()
         
         val_acc = correct / total
+        top3_acc = top3_correct / total
         train_losses.append(epoch_loss / len(train_loader))
         val_accs.append(val_acc)
         
+        # Save best model
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), 'lstm_predictor.pth')
+        
         if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1}/50 | Loss: {train_losses[-1]:.4f} | Val Acc: {val_acc:.4f}")
+            print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {train_losses[-1]:.4f} | "
+                  f"Top-1: {val_acc:.4f} | Top-3: {top3_acc:.4f} | "
+                  f"Best: {best_acc:.4f}")
     
-    torch.save(model.state_dict(), 'lstm_predictor.pth')
-    print(f"\n✓ LSTM saved. Final accuracy: {val_accs[-1]:.4f}")
-    print(f"  (Random baseline: {1.0/config.NUM_BANDS:.4f})")
+    print(f"\n✓ LSTM saved (best top-1 acc: {best_acc:.4f})")
+    print(f"  Theoretical max: ~0.54  |  Random: {1.0/config.NUM_BANDS:.4f}")
     
     return model, train_losses, val_accs
 
 
 def train_dqn_jammer(config):
-    """Phase 2: Train DQN to optimize jamming strategy"""
+    """Phase 2: Train DQN with improved reward and longer training"""
     print("\n" + "=" * 60)
     print("PHASE 2: Training DQN Jammer Agent")
     print("=" * 60)
@@ -119,11 +144,15 @@ def train_dqn_jammer(config):
     episode_rewards = []
     jam_success_rates = []
     
-    for episode in range(config.NUM_EPISODES):
-        state = env.reset()
+    NUM_EPISODES = 1500  # ⭐ More episodes
+    
+    for episode in range(NUM_EPISODES):
+        # ⭐ Different seed per episode for diversity
+        state = env.reset(episode_seed=config.FH_SEED + episode * 13)
         total_reward = 0
         jams = 0
         steps = 0
+        hits = 0  # Direct hits
         
         for step in range(config.EPISODE_LENGTH):
             action = agent.select_action(state, training=True)
@@ -135,28 +164,30 @@ def train_dqn_jammer(config):
             state = next_state
             total_reward += reward
             jams += int(info['jammed'])
+            hits += int(action == info['true_band'])
             steps += 1
             
             if done:
                 break
         
         success_rate = jams / steps
+        hit_rate = hits / steps
         episode_rewards.append(total_reward)
         jam_success_rates.append(success_rate)
         
-        if (episode + 1) % 20 == 0:
-            avg_reward = np.mean(episode_rewards[-20:])
-            avg_success = np.mean(jam_success_rates[-20:])
-            print(f"Episode {episode+1}/{config.NUM_EPISODES} | "
-                  f"Avg Reward: {avg_reward:.2f} | "
-                  f"Jam Success: {avg_success:.3f} | "
-                  f"Epsilon: {agent.epsilon:.3f}")
+        if (episode + 1) % 50 == 0:
+            avg_reward = np.mean(episode_rewards[-50:])
+            avg_success = np.mean(jam_success_rates[-50:])
+            print(f"Episode {episode+1}/{NUM_EPISODES} | "
+                  f"Reward: {avg_reward:.2f} | "
+                  f"Jam Rate: {avg_success:.3f} | "
+                  f"Hit Rate: {hit_rate:.3f} | "
+                  f"ε: {agent.epsilon:.3f}")
     
     torch.save(agent.q_network.state_dict(), 'dqn_jammer.pth')
     print("\n✓ DQN agent saved.")
     
     return agent, episode_rewards, jam_success_rates
-
 
 def train_hybrid(config):
     """Phase 3: Train hybrid model with combined loss"""
@@ -165,9 +196,11 @@ def train_hybrid(config):
     print("=" * 60)
     
     device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
-    X, y = generate_training_data(config, num_sequences=10000)
     
-    split = int(0.8 * len(X))
+    # ⭐ MORE data
+    X, y = generate_training_data(config, num_sequences=50000)
+    
+    split = int(0.85 * len(X))
     X_train = torch.from_numpy(X[:split]).to(device)
     y_train = torch.from_numpy(y[:split]).to(device)
     X_val = torch.from_numpy(X[split:]).to(device)
@@ -179,15 +212,18 @@ def train_hybrid(config):
         hidden_size=config.LSTM_HIDDEN_SIZE
     ).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     
-    for epoch in range(50):
+    NUM_EPOCHS = 100
+    best_jam_score = 0
+    
+    for epoch in range(NUM_EPOCHS):
         model.train()
-        # Mini-batches
         perm = torch.randperm(len(X_train))
         losses = []
-        for i in range(0, len(X_train), 64):
-            idx = perm[i:i+64]
+        for i in range(0, len(X_train), 128):
+            idx = perm[i:i+128]
             xb, yb = X_train[idx], y_train[idx]
             
             pred_logits, pred_probs, power_alloc = model(xb)
@@ -195,37 +231,43 @@ def train_hybrid(config):
             # Loss 1: Prediction accuracy
             pred_loss = nn.CrossEntropyLoss()(pred_logits, yb)
             
-            # Loss 2: Power should match true band (jamming reward)
+            # Loss 2: Maximize power on true band
             target_onehot = F.one_hot(yb, config.NUM_BANDS).float()
-            # Maximize power on true band
             power_reward = -(power_alloc * target_onehot).sum(dim=-1).mean()
             
-            # Entropy regularization (avoid concentrating all power on one band)
+            # Loss 3: Light entropy regularization (avoid total collapse)
             entropy_reg = -(power_alloc * torch.log(power_alloc + 1e-10)).sum(dim=-1).mean()
             
-            loss = pred_loss + power_reward - 0.01 * entropy_reg
+            # ⭐ Better balance — emphasize prediction
+            loss = 2.0 * pred_loss + power_reward - 0.001 * entropy_reg
             
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             losses.append(loss.item())
         
-        # Validation
+        scheduler.step()
+        
         model.eval()
         with torch.no_grad():
             _, val_probs, val_power = model(X_val)
             val_acc = (val_probs.argmax(dim=-1) == y_val).float().mean().item()
-            # Power on true band
             target_onehot = F.one_hot(y_val, config.NUM_BANDS).float()
             avg_power_on_true = (val_power * target_onehot).sum(dim=-1).mean().item()
         
+        # Save best
+        if avg_power_on_true > best_jam_score:
+            best_jam_score = avg_power_on_true
+            torch.save(model.state_dict(), 'hybrid_jammer.pth')
+        
         if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1}/50 | Loss: {np.mean(losses):.4f} | "
+            print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {np.mean(losses):.4f} | "
                   f"Pred Acc: {val_acc:.4f} | "
-                  f"Avg Power on True Band: {avg_power_on_true:.4f}")
+                  f"Power on True: {avg_power_on_true:.4f} | "
+                  f"Best: {best_jam_score:.4f}")
     
-    torch.save(model.state_dict(), 'hybrid_jammer.pth')
-    print("\n✓ Hybrid model saved.")
+    print(f"\n✓ Hybrid saved (best power score: {best_jam_score:.4f})")
     return model
 
 
